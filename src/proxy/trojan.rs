@@ -1,40 +1,32 @@
 use super::ProxyStream;
 use tokio::io::AsyncReadExt;
-use crate::common::{parse_addr, parse_port};
+use crate::common::{parse_addr, parse_port, AddrKind};
+use sha2::{Digest, Sha224};
 use worker::*;
 
 impl <'a> ProxyStream<'a> {
     pub async fn process_trojan(&mut self) -> Result<()> {
-        // ignore user_id
-        let mut _user_id = [0u8; 56];
-        self.read_exact(&mut _user_id).await?;
+        let mut user_id = [0u8; 56];
+        self.read_exact(&mut user_id).await?;
 
-        // remove crlf
+        let expected_hash = Sha224::digest(self.config.uuid.to_string().as_bytes());
+        let expected_hex: String = expected_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        if user_id.as_slice() != expected_hex.as_bytes() {
+            return Err(Error::RustError("invalid password".to_string()));
+        }
+
         self.read_u16().await?;
         
-        // read instruction
         let network_type = self.read_u8().await?;
         let is_tcp = network_type == 1;
 
-        // read port and address
-        let remote_addr = parse_addr(self).await?;
+        let remote_addr = parse_addr(self, AddrKind::Socks5Like).await?;
         let remote_port = parse_port(self).await?;
 
-        // remove crlf
         self.read_u16().await?;
 
         if is_tcp {
-            let addr_pool = [
-                (remote_addr.clone(), remote_port),
-                (self.config.proxy_addr.clone(), self.config.proxy_port)
-            ];
-
-            // send header
-            for (target_addr, target_port) in addr_pool {
-                if let Err(e) = self.handle_tcp_outbound(target_addr, target_port).await {
-                    console_error!("error handling tcp: {}", e)
-                }
-            }
+            self.handle_outbound(remote_addr, remote_port).await?;
         } else {
             if let Err(e) = self.handle_udp_outbound().await {
                 console_error!("error handling udp: {}", e)
