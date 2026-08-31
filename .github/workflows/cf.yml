@@ -1,4 +1,4 @@
-name: cf workers
+name: Deploy to Cloudflare Workers
 
 on:
   workflow_dispatch:
@@ -7,16 +7,30 @@ on:
     branches:
       - master
     paths-ignore:
-      - 'README.md'
-      - 'LICENSE.md'
+      - "README.md"
+      - "LICENSE.md"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: cf
     steps:
-      - uses: actions/checkout@v4
-      - name: deploy
-        uses: cloudflare/wrangler-action@v3
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain (wasm32)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache: true
+          cache-on-failure: true
+          rustflags: ""
+
+      - name: Refresh Cargo.lock
+        run: cargo update
+
+      - name: Build & Deploy Worker
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
