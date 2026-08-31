@@ -11,7 +11,7 @@ pub async fn doh(req_wireformat: &[u8]) -> Result<Vec<u8>> {
     headers.insert(ACCEPT, HeaderValue::from_static("application/dns-message"));
     let client = Client::new();
     let response = client
-        .post("https://1.1.1.1/dns-query")
+        .post("https://cloudflare-dns.com/dns-query")
         .headers(headers)
         .body(req_wireformat.to_vec())
         .send()
