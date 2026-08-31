@@ -5,15 +5,47 @@ minify = true
 
 [[kv_namespaces]]
 binding = "SIREN"
-id = "bc99493fbd1f40fcbe0016ff8ed13ff4"
+id = "32c1ba63a98144e49f549417fa66476e"
+
+[[durable_objects.bindings]]
+name = "STATS"
+class_name = "StatsCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StatsCounter"]
 
 [build]
-command = "cargo install worker-build && worker-build --release"
+command = "cargo install worker-build@^0.1 && worker-build --release"
 
 [env.dev]
-build = { command = "cargo install worker-build && worker-build --dev" }
+build = { command = "cargo install worker-build@^0.1 --locked && worker-build --dev" }
+
+[[routes]]
+pattern = "siren.zet-y.web.id"
+custom_domain = true
+
+[[routes]]
+pattern = "api24-normal.tiktokv.com.siren.zet-y.web.id"
+custom_domain = true
+
+[[routes]]
+pattern = "support.zoom.us.siren.zet-y.web.id"
+custom_domain = true
+
+[[routes]]
+pattern = "graph.instagram.com.siren.zet-y.web.id"
+custom_domain = true
+
+[[routes]]
+pattern = "investors.spotify.com.siren.zet-y.web.id"
+custom_domain = true
+
+[[routes]]
+pattern = "listen.noice.id.siren.zet-y.web.id"
+custom_domain = true
 
 [vars]
-UUID = "f282b878-8711-45a1-8c69-5564172123c1"
-MAIN_PAGE_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Siren/refs/heads/master/web/index.html"
-SUB_PAGE_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Siren/refs/heads/master/web/sub.html"
+UUID = "7e8fa1ce-47ef-4445-bcad-7470c63fbda1"
+MAIN_PAGE_URL = "https://raw.githubusercontent.com/zx-vm/Siren/refs/heads/master/web/index.html"
+SUB_PAGE_URL = "https://raw.githubusercontent.com/zx-vm/Siren/refs/heads/master/web/sub.html"
