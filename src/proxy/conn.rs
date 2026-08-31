@@ -1,16 +1,35 @@
-use crate::config::Config;
+use crate::config::{Config, ProxyMode};
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::{BufMut, BytesMut};
+use futures_util::future::{select, Either};
 use futures_util::Stream;
 use pin_project_lite::pin_project;
 use pretty_bytes::converter::convert;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use worker::*;
 
-static MAX_WEBSOCKET_SIZE: usize = 64 * 1024; // 64kb
-static MAX_BUFFER_SIZE: usize = 512 * 1024; // 512kb
+const OUTBOUND_HANDSHAKE_TIMEOUT_SECS: u64 = 1;
+
+async fn with_timeout<F, T>(secs: u64, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let boxed_fut = Box::pin(fut);
+    let boxed_timeout = Box::pin(Delay::from(Duration::from_secs(secs)));
+
+    match select(boxed_fut, boxed_timeout).await {
+        Either::Left((res, _)) => res,
+        Either::Right((_, _)) => Err(Error::RustError(format!("timeout setelah {secs} detik"))),
+    }
+}
+
+static MAX_WEBSOCKET_SIZE: usize = 512 * 1024;
+static MAX_BUFFER_SIZE: usize = 1024 * 1024; 
 
 pin_project! {
     pub struct ProxyStream<'a> {
@@ -24,7 +43,7 @@ pin_project! {
 
 impl<'a> ProxyStream<'a> {
     pub fn new(config: Config, ws: &'a WebSocket, events: EventStream<'a>) -> Self {
-        let buffer = BytesMut::with_capacity(MAX_BUFFER_SIZE);
+        let buffer = BytesMut::with_capacity(8 * 1024);
 
         Self {
             config,
@@ -102,7 +121,7 @@ impl<'a> ProxyStream<'a> {
                 let remote_port = u16::from_be_bytes([buffer[5], buffer[6]]);
                 remote_port != 0
             }
-            3 => { // Domain name
+            3 => { // Domain
                 if buffer.len() < 2 {
                     return false;
                 }
@@ -135,23 +154,241 @@ impl<'a> ProxyStream<'a> {
         buffer.len() > 0 // fallback
     }
 
-    pub async fn handle_tcp_outbound(&mut self, addr: String, port: u16) -> Result<()> {
-        let mut remote_socket = Socket::builder().connect(&addr, port).map_err(|e| {
+    async fn connect_direct(addr: String, port: u16) -> Result<Socket> {
+        let mut s = Socket::builder().connect(&addr, port).map_err(|e| {
             Error::RustError(e.to_string())
         })?;
-
-        remote_socket.opened().await.map_err(|e| {
+        s.opened().await.map_err(|e| {
             Error::RustError(e.to_string())
         })?;
+        Ok(s)
+    }
 
-        tokio::io::copy_bidirectional(self, &mut remote_socket)
+    async fn resolve_fallback_socket(
+        proxy_mode: ProxyMode,
+        remote_addr: String,
+        remote_port: u16,
+        proxy_addr: String,
+        proxy_port: u16,
+    ) -> Result<Socket> {
+        match proxy_mode {
+            ProxyMode::Direct => Self::connect_direct(proxy_addr, proxy_port).await,
+            ProxyMode::Socks5 { host, port, user, pass } => {
+                Self::socks5_handshake(host, port, user, pass, remote_addr, remote_port).await
+            }
+            ProxyMode::Http { host, port, user, pass } => {
+                Self::http_connect_handshake(host, port, user, pass, remote_addr, remote_port).await
+            }
+        }
+    }
+
+    pub async fn handle_outbound(&mut self, remote_addr: String, remote_port: u16) -> Result<()> {
+        let direct_fut = with_timeout(
+            OUTBOUND_HANDSHAKE_TIMEOUT_SECS,
+            Self::connect_direct(remote_addr.clone(), remote_port),
+        );
+        let fallback_fut = with_timeout(
+            OUTBOUND_HANDSHAKE_TIMEOUT_SECS,
+            Self::resolve_fallback_socket(
+                self.config.proxy_mode.clone(),
+                remote_addr.clone(),
+                remote_port,
+                self.config.proxy_addr.clone(),
+                self.config.proxy_port,
+            ),
+        );
+
+        let mut remote_socket = match select(Box::pin(direct_fut), Box::pin(fallback_fut)).await {
+            Either::Left((Ok(s), _)) => s,
+            Either::Left((Err(e1), pending_fallback)) => {
+                console_log!("[direct] gagal/timeout ({}), nunggu jalur fallback...", e1);
+                match pending_fallback.await {
+                    Ok(s) => s,
+                    Err(e2) => {
+                        console_error!("[fallback] juga gagal: {}", e2);
+                        return Ok(());
+                    }
+                }
+            }
+            Either::Right((Ok(s), _)) => s,
+            Either::Right((Err(e2), pending_direct)) => {
+                console_log!("[fallback] gagal/timeout ({}), nunggu jalur direct...", e2);
+                match pending_direct.await {
+                    Ok(s) => s,
+                    Err(e1) => {
+                        console_error!("[direct] juga gagal: {}", e1);
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        let (up, down) = tokio::io::copy_bidirectional_with_sizes(self, &mut remote_socket, MAX_WEBSOCKET_SIZE, MAX_WEBSOCKET_SIZE)
             .await
-            .map(|(a_to_b, b_to_a)| {
-                console_log!("copied data from {}:{}, up: {} and dl: {}", &addr, &port, convert(a_to_b as f64), convert(b_to_a as f64));
-            })
-            .map_err(|e| {
-                Error::RustError(e.to_string())
-            })?;
+            .map_err(|e| Error::RustError(e.to_string()))?;
+        console_log!("copied data {}:{}, up: {} and dl: {}", &remote_addr, remote_port, convert(up as f64), convert(down as f64));
+        self.record_usage(up, down).await;
+
+        Ok(())
+    }
+
+    async fn socks5_handshake(
+        proxy_host: String,
+        proxy_port: u16,
+        user: Option<String>,
+        pass: Option<String>,
+        target_addr: String,
+        target_port: u16,
+    ) -> Result<Socket> {
+        let mut remote_socket = Socket::builder().connect(&proxy_host, proxy_port).map_err(|e| {
+            Error::RustError(e.to_string())
+        })?;
+        remote_socket.opened().await.map_err(|e| Error::RustError(e.to_string()))?;
+
+        let creds = user.as_ref().zip(pass.as_ref());
+
+        let methods: &[u8] = if creds.is_some() { &[0x00, 0x02] } else { &[0x00] };
+        let mut greeting = vec![0x05u8, methods.len() as u8];
+        greeting.extend_from_slice(methods);
+        remote_socket.write_all(&greeting).await.map_err(|e| Error::RustError(e.to_string()))?;
+
+        let mut method_resp = [0u8; 2];
+        remote_socket.read_exact(&mut method_resp).await.map_err(|e| Error::RustError(e.to_string()))?;
+        if method_resp[0] != 0x05 {
+            return Err(Error::RustError("versi SOCKS5 tidak valid dari proxy".to_string()));
+        }
+
+        match method_resp[1] {
+            0x00 => {} 
+            0x02 => {
+                let (u, p) = creds.ok_or_else(|| Error::RustError("proxy SOCKS5 minta autentikasi, tapi user/pass tidak diisi".to_string()))?;
+                let mut auth = vec![0x01u8, u.len() as u8];
+                auth.extend_from_slice(u.as_bytes());
+                auth.push(p.len() as u8);
+                auth.extend_from_slice(p.as_bytes());
+                remote_socket.write_all(&auth).await.map_err(|e| Error::RustError(e.to_string()))?;
+
+                let mut auth_resp = [0u8; 2];
+                remote_socket.read_exact(&mut auth_resp).await.map_err(|e| Error::RustError(e.to_string()))?;
+                if auth_resp[1] != 0x00 {
+                    return Err(Error::RustError("autentikasi SOCKS5 gagal".to_string()));
+                }
+            }
+            0xFF => return Err(Error::RustError("proxy SOCKS5 menolak semua metode auth".to_string())),
+            other => return Err(Error::RustError(format!("metode auth SOCKS5 tidak didukung: {other}"))),
+        }
+
+        let mut req = vec![0x05u8, 0x01, 0x00];
+        if let Ok(ip) = target_addr.parse::<Ipv4Addr>() {
+            req.push(0x01);
+            req.extend_from_slice(&ip.octets());
+        } else if let Ok(ip) = target_addr.parse::<Ipv6Addr>() {
+            req.push(0x04);
+            req.extend_from_slice(&ip.octets());
+        } else {
+            let domain = target_addr.as_bytes();
+            if domain.len() > 255 {
+                return Err(Error::RustError("domain terlalu panjang untuk SOCKS5".to_string()));
+            }
+            req.push(0x03);
+            req.push(domain.len() as u8);
+            req.extend_from_slice(domain);
+        }
+        req.extend_from_slice(&target_port.to_be_bytes());
+        remote_socket.write_all(&req).await.map_err(|e| Error::RustError(e.to_string()))?;
+
+        let mut head = [0u8; 4];
+        remote_socket.read_exact(&mut head).await.map_err(|e| Error::RustError(e.to_string()))?;
+        if head[0] != 0x05 {
+            return Err(Error::RustError("versi SOCKS5 tidak valid pada balasan".to_string()));
+        }
+        if head[1] != 0x00 {
+            return Err(Error::RustError(format!("proxy SOCKS5 menolak koneksi, kode {}", head[1])));
+        }
+        match head[3] {
+            0x01 => {
+                let mut rest = [0u8; 4 + 2];
+                remote_socket.read_exact(&mut rest).await.map_err(|e| Error::RustError(e.to_string()))?;
+            }
+            0x04 => {
+                let mut rest = [0u8; 16 + 2];
+                remote_socket.read_exact(&mut rest).await.map_err(|e| Error::RustError(e.to_string()))?;
+            }
+            0x03 => {
+                let mut len_buf = [0u8; 1];
+                remote_socket.read_exact(&mut len_buf).await.map_err(|e| Error::RustError(e.to_string()))?;
+                let mut rest = vec![0u8; len_buf[0] as usize + 2];
+                remote_socket.read_exact(&mut rest).await.map_err(|e| Error::RustError(e.to_string()))?;
+            }
+            other => return Err(Error::RustError(format!("tipe alamat SOCKS5 tidak dikenal pada balasan: {other}"))),
+        }
+
+        Ok(remote_socket)
+    }
+
+    async fn http_connect_handshake(
+        proxy_host: String,
+        proxy_port: u16,
+        user: Option<String>,
+        pass: Option<String>,
+        target_addr: String,
+        target_port: u16,
+    ) -> Result<Socket> {
+        let mut remote_socket = Socket::builder().connect(&proxy_host, proxy_port).map_err(|e| {
+            Error::RustError(e.to_string())
+        })?;
+        remote_socket.opened().await.map_err(|e| Error::RustError(e.to_string()))?;
+
+        let target = format!("{target_addr}:{target_port}");
+        let mut connect_req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
+        if let (Some(u), Some(p)) = (user.as_ref(), pass.as_ref()) {
+            let basic = STANDARD.encode(format!("{u}:{p}"));
+            connect_req.push_str(&format!("Proxy-Authorization: Basic {basic}\r\n"));
+        }
+        connect_req.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+        remote_socket.write_all(connect_req.as_bytes()).await.map_err(|e| Error::RustError(e.to_string()))?;
+
+        let mut resp_buf: Vec<u8> = Vec::with_capacity(512);
+        let mut byte = [0u8; 1];
+        loop {
+            remote_socket.read_exact(&mut byte).await.map_err(|e| Error::RustError(e.to_string()))?;
+            resp_buf.push(byte[0]);
+            if resp_buf.len() >= 4 && &resp_buf[resp_buf.len() - 4..] == b"\r\n\r\n" {
+                break;
+            }
+            if resp_buf.len() > 8192 {
+                return Err(Error::RustError("header balasan HTTP proxy kepanjangan".to_string()));
+            }
+        }
+
+        let resp_text = String::from_utf8_lossy(&resp_buf);
+        let status_line = resp_text.lines().next().unwrap_or_default();
+        let status_ok = status_line
+            .split_whitespace()
+            .nth(1)
+            .map(|code| code.starts_with('2'))
+            .unwrap_or(false);
+        if !status_ok {
+            return Err(Error::RustError(format!("HTTP proxy menolak CONNECT: {status_line}")));
+        }
+
+        Ok(remote_socket)
+    }
+
+    async fn record_usage(&self, up: u64, down: u64) {
+        if let Err(e) = self.record_usage_inner(up, down).await {
+            console_error!("gagal update statistik pemakaian: {}", e);
+        }
+    }
+
+    async fn record_usage_inner(&self, up: u64, down: u64) -> Result<()> {
+        let url = format!("https://stats.internal/record?up={up}&down={down}");
+        let mut res = self.config.stats.fetch_with_str(&url).await?;
+        if res.status_code() != 200 {
+            let body = res.text().await.unwrap_or_default();
+            return Err(Error::RustError(format!("DO /record balas status {}: {}", res.status_code(), body)));
+        }
+        console_log!("statistik terkirim ke DO: up={} down={}", up, down);
         Ok(())
     }
 
